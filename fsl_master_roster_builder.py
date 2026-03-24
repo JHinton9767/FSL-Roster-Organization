@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 import argparse
@@ -12,9 +13,9 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT_ROOT = ROOT / "Copy of Rosters"
-SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+SUPPORTED_EXTENSIONS = {".xls", ".xlsx", ".xlsm", ".xltx", ".xltm"}
 SEMESTER_FOLDER_RE = re.compile(r"^(Fall|Spring)\s+(20\d{2})$", re.IGNORECASE)
 
 STANDARD_COLUMNS = [
@@ -92,11 +93,6 @@ HEADER_ALIASES = {
     ],
 }
 
-CANONICAL_ALIAS_MAP = {
-    standard_name: {re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", "", alias.lower().replace("_", " "))).strip() for alias in aliases}
-    for standard_name, aliases in HEADER_ALIASES.items()
-}
-
 STATUS_MAP = {
     "A": "Active",
     "AL": "Alumni",
@@ -107,6 +103,28 @@ STATUS_MAP = {
     "RS": "Resigned",
     "RV": "Revoked",
     "T": "Transfer",
+}
+
+
+def clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def canonical_header(value: object) -> str:
+    text = clean_text(value).lower()
+    text = text.replace("_", " ")
+    text = re.sub(r"[^a-z0-9 ]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+CANONICAL_ALIAS_MAP = {
+    standard_name: {canonical_header(alias) for alias in aliases}
+    for standard_name, aliases in HEADER_ALIASES.items()
 }
 
 
@@ -142,22 +160,6 @@ class ExtractedRow:
         ]
 
 
-def clean_text(value: object) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def canonical_header(value: object) -> str:
-    text = clean_text(value).lower()
-    text = text.replace("_", " ")
-    text = re.sub(r"[^a-z0-9 ]+", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
 def normalize_status(value: str) -> str:
     raw = clean_text(value)
     upper = raw.upper()
@@ -191,13 +193,20 @@ def parse_term_from_path(path: Path) -> Tuple[str, str]:
 
 
 def infer_chapter(path: Path, sheet_name: str) -> str:
+    ignored_names = {
+        "copy of rosters",
+        "rosters",
+        "raw rosters",
+        "master roster",
+    }
+
     for candidate in [sheet_name, path.stem, path.parent.name]:
         cleaned = clean_text(candidate)
         if not cleaned:
             continue
         if SEMESTER_FOLDER_RE.fullmatch(cleaned):
             continue
-        if cleaned.lower() in {"copy of rosters", "rosters", "raw rosters", "master roster"}:
+        if cleaned.lower() in ignored_names:
             continue
         if re.fullmatch(r"(19|20)\d{2}", cleaned):
             continue
@@ -215,13 +224,35 @@ def score_header_row(values: List[object]) -> Tuple[int, Dict[str, int]]:
     return len(matched), matched
 
 
+def is_banner_row(values: List[object]) -> bool:
+    text_parts = [clean_text(value) for value in values if clean_text(value)]
+    if len(text_parts) != 1:
+        return False
+
+    text = text_parts[0].lower()
+    return "roster" in text and any(term in text for term in ["fall", "spring", "summer", "winter"])
+
+
 def find_header_row(ws) -> Tuple[Optional[int], Dict[str, int]]:
     best_score = 0
     best_row_idx = None
     best_map: Dict[str, int] = {}
 
-    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 25), values_only=True), start=1):
-        score, header_map = score_header_row(list(row))
+    max_scan_row = min(ws.max_row, 25)
+    cached_rows = list(ws.iter_rows(min_row=1, max_row=max_scan_row, values_only=True))
+
+    for row_idx, row in enumerate(cached_rows, start=1):
+        row_values = list(row)
+
+        if is_banner_row(row_values) and row_idx < len(cached_rows):
+            next_values = list(cached_rows[row_idx])
+            next_score, next_map = score_header_row(next_values)
+            if next_score > best_score:
+                best_score = next_score
+                best_row_idx = row_idx + 1
+                best_map = next_map
+
+        score, header_map = score_header_row(row_values)
         if score > best_score:
             best_score = score
             best_row_idx = row_idx
@@ -521,7 +552,13 @@ def build_master_roster(
     )
     write_year_sheets(wb, all_rows, chunk_size=chunk_size)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(output_file)
+
+    try:
+        wb.save(output_file)
+    except PermissionError:
+        raise PermissionError(
+            f"Cannot write to '{output_file}'. Close the workbook in Excel or use a different output filename."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -579,3 +616,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+```
