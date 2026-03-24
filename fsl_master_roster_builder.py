@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 
 import argparse
@@ -15,7 +14,7 @@ from openpyxl.utils import get_column_letter
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT_ROOT = ROOT / "Copy of Rosters"
-SUPPORTED_EXTENSIONS = {".xls", ".xlsx", ".xlsm", ".xltx", ".xltm"}
+SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
 SEMESTER_FOLDER_RE = re.compile(r"^(Fall|Spring)\s+(20\d{2})$", re.IGNORECASE)
 
 STANDARD_COLUMNS = [
@@ -233,35 +232,95 @@ def is_banner_row(values: List[object]) -> bool:
     return "roster" in text and any(term in text for term in ["fall", "spring", "summer", "winter"])
 
 
-def find_header_row(ws) -> Tuple[Optional[int], Dict[str, int]]:
-    best_score = 0
-    best_row_idx = None
-    best_map: Dict[str, int] = {}
+def extract_header_blocks_from_row(values: List[object]) -> List[Dict[str, object]]:
+    canon = [canonical_header(value) for value in values]
+    matches: List[Tuple[int, str]] = []
 
-    max_scan_row = min(ws.max_row, 25)
+    for idx, header in enumerate(canon):
+        for standard_name, aliases in CANONICAL_ALIAS_MAP.items():
+            if header in aliases:
+                matches.append((idx, standard_name))
+                break
+
+    if not matches:
+        return []
+
+    blocks: List[List[Tuple[int, str]]] = []
+    current_block: List[Tuple[int, str]] = [matches[0]]
+
+    for idx, standard_name in matches[1:]:
+        prev_idx = current_block[-1][0]
+        if idx - prev_idx <= 2:
+            current_block.append((idx, standard_name))
+        else:
+            blocks.append(current_block)
+            current_block = [(idx, standard_name)]
+    blocks.append(current_block)
+
+    results: List[Dict[str, object]] = []
+    required = {"last_name", "first_name"}
+
+    for block in blocks:
+        header_map: Dict[str, int] = {}
+        for idx, standard_name in block:
+            if standard_name not in header_map:
+                header_map[standard_name] = idx
+
+        if len(header_map) >= 3 and required.issubset(header_map):
+            start_col = min(header_map.values())
+            end_col = max(header_map.values())
+            results.append(
+                {
+                    "start_col": start_col,
+                    "end_col": end_col,
+                    "header_map": header_map,
+                    "score": len(header_map),
+                }
+            )
+
+    return results
+
+
+def find_header_blocks(ws) -> List[Dict[str, object]]:
+    max_scan_row = min(ws.max_row, 30)
     cached_rows = list(ws.iter_rows(min_row=1, max_row=max_scan_row, values_only=True))
+    best_blocks: Dict[Tuple[int, ...], Dict[str, object]] = {}
 
     for row_idx, row in enumerate(cached_rows, start=1):
-        row_values = list(row)
+        candidate_rows = [(row_idx, list(row))]
 
-        if is_banner_row(row_values) and row_idx < len(cached_rows):
-            next_values = list(cached_rows[row_idx])
-            next_score, next_map = score_header_row(next_values)
-            if next_score > best_score:
-                best_score = next_score
-                best_row_idx = row_idx + 1
-                best_map = next_map
+        if is_banner_row(list(row)) and row_idx < len(cached_rows):
+            candidate_rows.append((row_idx + 1, list(cached_rows[row_idx])))
 
-        score, header_map = score_header_row(row_values)
-        if score > best_score:
-            best_score = score
-            best_row_idx = row_idx
-            best_map = header_map
+        for candidate_idx, candidate_values in candidate_rows:
+            blocks = extract_header_blocks_from_row(candidate_values)
+            for block in blocks:
+                header_map = block["header_map"]
+                signature = tuple(sorted(header_map.values()))
+                existing = best_blocks.get(signature)
 
-    required = {"last_name", "first_name"}
-    if best_row_idx is None or best_score < 3 or not required.issubset(best_map):
-        return None, {}
-    return best_row_idx, best_map
+                block_record = {
+                    "row_idx": candidate_idx,
+                    "start_col": block["start_col"],
+                    "end_col": block["end_col"],
+                    "header_map": header_map,
+                    "score": block["score"],
+                }
+
+                if existing is None:
+                    best_blocks[signature] = block_record
+                else:
+                    if block_record["score"] > existing["score"]:
+                        best_blocks[signature] = block_record
+                    elif block_record["score"] == existing["score"] and block_record["row_idx"] < existing["row_idx"]:
+                        best_blocks[signature] = block_record
+
+    return sorted(best_blocks.values(), key=lambda item: (item["row_idx"], item["start_col"]))
+
+
+def row_looks_like_header(values: List[object]) -> bool:
+    score, header_map = score_header_row(values)
+    return score >= 3 and {"last_name", "first_name"}.issubset(header_map)
 
 
 def get_cell(row: Tuple[object, ...], index: Optional[int]) -> str:
@@ -288,44 +347,60 @@ def extract_rows_from_workbook(path: Path, verbose: bool = False) -> Tuple[List[
         academic_year, term = parse_term_from_path(path)
 
         for ws in wb.worksheets:
-            header_row_idx, header_map = find_header_row(ws)
-            if header_row_idx is None:
-                issues.append(f"Skipped {path.name} | sheet '{ws.title}': no usable header row found.")
+            header_blocks = find_header_blocks(ws)
+            if not header_blocks:
+                issues.append(f"Skipped {path.name} | sheet '{ws.title}': no usable header blocks found.")
                 continue
 
-            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
-                last_name = get_cell(row, header_map.get("last_name"))
-                first_name = get_cell(row, header_map.get("first_name"))
-                banner_id = normalize_banner_id(get_cell(row, header_map.get("banner_id")))
-                email = get_cell(row, header_map.get("email")).lower()
-                status = normalize_status(get_cell(row, header_map.get("status")))
-                semester_joined = get_cell(row, header_map.get("semester_joined"))
-                position = get_cell(row, header_map.get("position"))
-                chapter = get_cell(row, header_map.get("chapter")) or infer_chapter(path, ws.title)
+            sheet_rows = list(ws.iter_rows(values_only=True))
 
-                core_values = [last_name, first_name, banner_id, email, status, semester_joined, position, chapter]
-                if row_is_empty(core_values):
-                    continue
+            for block in header_blocks:
+                header_row_idx = block["row_idx"]
+                header_map = block["header_map"]
+                start_col = block["start_col"]
+                end_col = block["end_col"]
 
-                if not last_name and not first_name:
-                    continue
+                for row in sheet_rows[header_row_idx:]:
+                    block_slice = list(row[start_col : end_col + 1])
 
-                rows.append(
-                    ExtractedRow(
-                        academic_year=academic_year,
-                        term=term,
-                        source_file=path.name,
-                        source_sheet=ws.title,
-                        chapter=chapter,
-                        last_name=last_name,
-                        first_name=first_name,
-                        banner_id=banner_id,
-                        email=email,
-                        status=status,
-                        semester_joined=semester_joined,
-                        position=position,
+                    if is_banner_row(block_slice):
+                        continue
+
+                    if row_looks_like_header(block_slice):
+                        continue
+
+                    last_name = get_cell(row, header_map.get("last_name"))
+                    first_name = get_cell(row, header_map.get("first_name"))
+                    banner_id = normalize_banner_id(get_cell(row, header_map.get("banner_id")))
+                    email = get_cell(row, header_map.get("email")).lower()
+                    status = normalize_status(get_cell(row, header_map.get("status")))
+                    semester_joined = get_cell(row, header_map.get("semester_joined"))
+                    position = get_cell(row, header_map.get("position"))
+                    chapter = get_cell(row, header_map.get("chapter")) or infer_chapter(path, ws.title)
+
+                    core_values = [last_name, first_name, banner_id, email, status, semester_joined, position, chapter]
+                    if row_is_empty(core_values):
+                        continue
+
+                    if not last_name and not first_name:
+                        continue
+
+                    rows.append(
+                        ExtractedRow(
+                            academic_year=academic_year,
+                            term=term,
+                            source_file=path.name,
+                            source_sheet=ws.title,
+                            chapter=chapter,
+                            last_name=last_name,
+                            first_name=first_name,
+                            banner_id=banner_id,
+                            email=email,
+                            status=status,
+                            semester_joined=semester_joined,
+                            position=position,
+                        )
                     )
-                )
     finally:
         wb.close()
 
@@ -445,6 +520,7 @@ def write_summary_sheet(
         ["Rows with Banner ID", with_banner],
         ["Rows missing Banner ID", missing_banner],
         ["Distinct academic years", len(by_year)],
+        ["Distinct terms", len(by_term)],
         ["Distinct chapters", len(chapters)],
         ["Duplicate rows removed", duplicates_removed],
         ["Same-year duplicate Banner IDs removed", same_year_id_removed],
@@ -616,4 +692,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```
