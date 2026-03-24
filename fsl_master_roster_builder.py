@@ -5,16 +5,21 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_INPUT_ROOT = ROOT / "Copy of Rosters"
 SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm", ".xltx", ".xltm"}
+SEMESTER_FOLDER_RE = re.compile(r"^(Fall|Spring)\s+(20\d{2})$", re.IGNORECASE)
 
 STANDARD_COLUMNS = [
-    "Year",
+    "Academic Year",
+    "Term",
     "Source File",
     "Source Sheet",
     "Chapter",
@@ -43,10 +48,10 @@ HEADER_ALIASES = {
     "banner_id": [
         "banner id",
         "student id",
-        "id",
         "banner",
         "student number",
         "banner number",
+        "z number",
     ],
     "email": [
         "email",
@@ -87,6 +92,11 @@ HEADER_ALIASES = {
     ],
 }
 
+CANONICAL_ALIAS_MAP = {
+    standard_name: {re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", "", alias.lower().replace("_", " "))).strip() for alias in aliases}
+    for standard_name, aliases in HEADER_ALIASES.items()
+}
+
 STATUS_MAP = {
     "A": "Active",
     "AL": "Alumni",
@@ -100,9 +110,10 @@ STATUS_MAP = {
 }
 
 
-@dataclass
+@dataclass(frozen=True)
 class ExtractedRow:
-    year: str
+    academic_year: str
+    term: str
     source_file: str
     source_sheet: str
     chapter: str
@@ -116,7 +127,8 @@ class ExtractedRow:
 
     def as_list(self) -> List[str]:
         return [
-            self.year,
+            self.academic_year,
+            self.term,
             self.source_file,
             self.source_sheet,
             self.chapter,
@@ -154,31 +166,50 @@ def normalize_status(value: str) -> str:
     return raw
 
 
-def infer_year(path: Path) -> str:
+def normalize_banner_id(value: str) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    return re.sub(r"\.0$", "", text)
+
+
+def parse_term_from_path(path: Path) -> Tuple[str, str]:
     for part in path.parts:
-        if re.fullmatch(r"(19|20)\d{2}", part):
-            return part
-    match = re.search(r"(19|20)\d{2}", path.stem)
-    if match:
-        return match.group(0)
-    return "Unknown"
+        match = SEMESTER_FOLDER_RE.fullmatch(part)
+        if match:
+            return match.group(2), f"{match.group(1).title()} {match.group(2)}"
+
+    for candidate in [path.parent.name, path.stem]:
+        match = SEMESTER_FOLDER_RE.search(candidate)
+        if match:
+            return match.group(2), f"{match.group(1).title()} {match.group(2)}"
+
+    year_match = re.search(r"(20\d{2}|19\d{2})", path.stem)
+    if year_match:
+        return year_match.group(1), year_match.group(1)
+    return "Unknown", "Unknown"
 
 
 def infer_chapter(path: Path, sheet_name: str) -> str:
-    parent = path.parent.name
-    stem = path.stem
-    if re.fullmatch(r"(19|20)\d{2}", parent):
-        return stem
-    if parent.lower() not in {"", "raw_rosters", "rosters"}:
-        return parent
-    return stem if stem.lower() != sheet_name.lower() else ""
+    for candidate in [sheet_name, path.stem, path.parent.name]:
+        cleaned = clean_text(candidate)
+        if not cleaned:
+            continue
+        if SEMESTER_FOLDER_RE.fullmatch(cleaned):
+            continue
+        if cleaned.lower() in {"copy of rosters", "rosters", "raw rosters", "master roster"}:
+            continue
+        if re.fullmatch(r"(19|20)\d{2}", cleaned):
+            continue
+        return cleaned
+    return ""
 
 
 def score_header_row(values: List[object]) -> Tuple[int, Dict[str, int]]:
     matched: Dict[str, int] = {}
-    canon = [canonical_header(v) for v in values]
+    canon = [canonical_header(value) for value in values]
     for idx, header in enumerate(canon):
-        for standard_name, aliases in HEADER_ALIASES.items():
+        for standard_name, aliases in CANONICAL_ALIAS_MAP.items():
             if header in aliases and standard_name not in matched:
                 matched[standard_name] = idx
     return len(matched), matched
@@ -188,12 +219,14 @@ def find_header_row(ws) -> Tuple[Optional[int], Dict[str, int]]:
     best_score = 0
     best_row_idx = None
     best_map: Dict[str, int] = {}
-    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 20), values_only=True), start=1):
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 25), values_only=True), start=1):
         score, header_map = score_header_row(list(row))
         if score > best_score:
             best_score = score
             best_row_idx = row_idx
             best_map = header_map
+
     required = {"last_name", "first_name"}
     if best_row_idx is None or best_score < 3 or not required.issubset(best_map):
         return None, {}
@@ -201,15 +234,13 @@ def find_header_row(ws) -> Tuple[Optional[int], Dict[str, int]]:
 
 
 def get_cell(row: Tuple[object, ...], index: Optional[int]) -> str:
-    if index is None:
-        return ""
-    if index >= len(row):
+    if index is None or index >= len(row):
         return ""
     return clean_text(row[index])
 
 
 def row_is_empty(values: Iterable[str]) -> bool:
-    return all(not clean_text(v) for v in values)
+    return all(not clean_text(value) for value in values)
 
 
 def extract_rows_from_workbook(path: Path, verbose: bool = False) -> Tuple[List[ExtractedRow], List[str]]:
@@ -222,74 +253,122 @@ def extract_rows_from_workbook(path: Path, verbose: bool = False) -> Tuple[List[
         issues.append(f"FAILED to open {path}: {exc}")
         return rows, issues
 
-    year = infer_year(path)
+    try:
+        academic_year, term = parse_term_from_path(path)
 
-    for ws in wb.worksheets:
-        header_row_idx, header_map = find_header_row(ws)
-        if header_row_idx is None:
-            issues.append(f"Skipped {path.name} | sheet '{ws.title}': no usable header row found.")
-            continue
-
-        for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
-            last_name = get_cell(row, header_map.get("last_name"))
-            first_name = get_cell(row, header_map.get("first_name"))
-            banner_id = get_cell(row, header_map.get("banner_id"))
-            email = get_cell(row, header_map.get("email"))
-            status = normalize_status(get_cell(row, header_map.get("status")))
-            semester_joined = get_cell(row, header_map.get("semester_joined"))
-            position = get_cell(row, header_map.get("position"))
-            chapter = get_cell(row, header_map.get("chapter")) or infer_chapter(path, ws.title)
-
-            core_values = [last_name, first_name, banner_id, email, status, semester_joined, position, chapter]
-            if row_is_empty(core_values):
+        for ws in wb.worksheets:
+            header_row_idx, header_map = find_header_row(ws)
+            if header_row_idx is None:
+                issues.append(f"Skipped {path.name} | sheet '{ws.title}': no usable header row found.")
                 continue
 
-            # Skip likely note/footer rows.
-            if not last_name and not first_name:
-                continue
+            for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+                last_name = get_cell(row, header_map.get("last_name"))
+                first_name = get_cell(row, header_map.get("first_name"))
+                banner_id = normalize_banner_id(get_cell(row, header_map.get("banner_id")))
+                email = get_cell(row, header_map.get("email")).lower()
+                status = normalize_status(get_cell(row, header_map.get("status")))
+                semester_joined = get_cell(row, header_map.get("semester_joined"))
+                position = get_cell(row, header_map.get("position"))
+                chapter = get_cell(row, header_map.get("chapter")) or infer_chapter(path, ws.title)
 
-            rows.append(
-                ExtractedRow(
-                    year=year,
-                    source_file=str(path.name),
-                    source_sheet=ws.title,
-                    chapter=chapter,
-                    last_name=last_name,
-                    first_name=first_name,
-                    banner_id=banner_id,
-                    email=email,
-                    status=status,
-                    semester_joined=semester_joined,
-                    position=position,
+                core_values = [last_name, first_name, banner_id, email, status, semester_joined, position, chapter]
+                if row_is_empty(core_values):
+                    continue
+
+                if not last_name and not first_name:
+                    continue
+
+                rows.append(
+                    ExtractedRow(
+                        academic_year=academic_year,
+                        term=term,
+                        source_file=path.name,
+                        source_sheet=ws.title,
+                        chapter=chapter,
+                        last_name=last_name,
+                        first_name=first_name,
+                        banner_id=banner_id,
+                        email=email,
+                        status=status,
+                        semester_joined=semester_joined,
+                        position=position,
+                    )
                 )
-            )
+    finally:
+        wb.close()
 
     if verbose:
         print(f"Processed {path}")
     return rows, issues
 
 
-def dedupe_rows(rows: List[ExtractedRow]) -> List[ExtractedRow]:
-    seen = set()
+def dedupe_rows(rows: List[ExtractedRow]) -> Tuple[List[ExtractedRow], int]:
+    seen: Set[Tuple[str, ...]] = set()
     deduped: List[ExtractedRow] = []
+    removed = 0
+
     for row in rows:
-        key = tuple(v.strip().lower() for v in row.as_list())
+        if row.banner_id:
+            key = ("banner", row.academic_year.lower(), row.term.lower(), row.banner_id.lower(), row.chapter.lower())
+        elif row.email:
+            key = ("email", row.academic_year.lower(), row.term.lower(), row.email.lower(), row.chapter.lower())
+        else:
+            key = (
+                "fallback",
+                row.academic_year.lower(),
+                row.term.lower(),
+                row.chapter.lower(),
+                row.last_name.lower(),
+                row.first_name.lower(),
+                row.semester_joined.lower(),
+            )
+
         if key in seen:
+            removed += 1
             continue
         seen.add(key)
         deduped.append(row)
-    return deduped
+
+    return deduped, removed
+
+
+def dedupe_same_year_banner_ids(rows: List[ExtractedRow]) -> Tuple[List[ExtractedRow], int]:
+    seen: Set[Tuple[str, str]] = set()
+    deduped: List[ExtractedRow] = []
+    removed = 0
+
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            item.academic_year.lower(),
+            item.banner_id.lower() if item.banner_id else "zzzzzzzz",
+            item.term.lower(),
+            item.chapter.lower(),
+            item.source_file.lower(),
+            item.source_sheet.lower(),
+        ),
+    ):
+        if row.banner_id:
+            key = (row.academic_year.lower(), row.banner_id.lower())
+            if key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+        deduped.append(row)
+
+    return deduped, removed
 
 
 def autosize_columns(ws) -> None:
     max_widths = defaultdict(int)
     for row in ws.iter_rows(values_only=True):
         for idx, value in enumerate(row, start=1):
-            length = len(clean_text(value))
-            if length > max_widths[idx]:
-                max_widths[idx] = length
+            width = len(clean_text(value))
+            if width > max_widths[idx]:
+                max_widths[idx] = width
     for idx, width in max_widths.items():
-        ws.column_dimensions[get_column_letter(idx)].width = min(max(width + 2, 12), 28)
+        ws.column_dimensions[get_column_letter(idx)].width = min(max(width + 2, 12), 32)
 
 
 def style_header(ws) -> None:
@@ -300,38 +379,63 @@ def style_header(ws) -> None:
         cell.font = font
 
 
-def write_summary_sheet(wb: Workbook, rows: List[ExtractedRow], issues: List[str]) -> None:
+def write_summary_sheet(
+    wb: Workbook,
+    rows: List[ExtractedRow],
+    issues: List[str],
+    total_files: int,
+    duplicates_removed: int,
+    same_year_id_removed: int,
+) -> None:
     ws = wb.active
     ws.title = "Summary"
     ws.append(["Metric", "Value"])
     style_header(ws)
 
     by_year = defaultdict(int)
+    by_term = defaultdict(int)
     with_banner = 0
     missing_banner = 0
+    chapters = set()
+
     for row in rows:
-        by_year[row.year] += 1
+        by_year[row.academic_year] += 1
+        by_term[row.term] += 1
         if row.banner_id:
             with_banner += 1
         else:
             missing_banner += 1
+        if row.chapter:
+            chapters.add(row.chapter)
 
     metrics = [
+        ["Input files processed", total_files],
         ["Total extracted rows", len(rows)],
         ["Rows with Banner ID", with_banner],
         ["Rows missing Banner ID", missing_banner],
-        ["Years found", len(by_year)],
+        ["Distinct academic years", len(by_year)],
+        ["Distinct chapters", len(chapters)],
+        ["Duplicate rows removed", duplicates_removed],
+        ["Same-year duplicate Banner IDs removed", same_year_id_removed],
     ]
     for item in metrics:
         ws.append(item)
 
     ws.append([])
-    ws.append(["Year", "Row Count"])
+    ws.append(["Academic Year", "Row Count"])
     for cell in ws[ws.max_row]:
         cell.fill = PatternFill("solid", fgColor="D9EAF7")
         cell.font = Font(bold=True)
-    for year in sorted(by_year.keys()):
-        ws.append([year, by_year[year]])
+    for academic_year in sorted(by_year.keys()):
+        ws.append([academic_year, by_year[academic_year]])
+
+    ws.append([])
+    ws.append(["Term", "Row Count"])
+    for cell in ws[ws.max_row]:
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        cell.font = Font(bold=True)
+    for term in sorted(by_term.keys()):
+        ws.append([term, by_term[term]])
 
     ws.append([])
     ws.append(["Import Issues"])
@@ -341,30 +445,35 @@ def write_summary_sheet(wb: Workbook, rows: List[ExtractedRow], issues: List[str
             ws.append([issue])
     else:
         ws.append(["None"])
+
+    ws.freeze_panes = "A2"
     autosize_columns(ws)
 
 
 def write_year_sheets(wb: Workbook, rows: List[ExtractedRow], chunk_size: int = 1000) -> None:
-    grouped = defaultdict(list)
+    grouped: Dict[str, List[ExtractedRow]] = defaultdict(list)
     for row in rows:
-        grouped[row.year].append(row)
+        grouped[row.academic_year].append(row)
 
-    for year in sorted(grouped.keys()):
-        year_rows = grouped[year]
-        year_rows.sort(key=lambda r: (
-            r.banner_id or "ZZZZZZZZ",
-            r.last_name.lower(),
-            r.first_name.lower(),
-            r.chapter.lower(),
-            r.source_file.lower(),
-            r.source_sheet.lower(),
-        ))
+    for academic_year in sorted(grouped.keys()):
+        year_rows = sorted(
+            grouped[academic_year],
+            key=lambda item: (
+                item.banner_id.lower() if item.banner_id else "zzzzzzzz",
+                item.last_name.lower(),
+                item.first_name.lower(),
+                item.term.lower(),
+                item.chapter.lower(),
+                item.source_file.lower(),
+                item.source_sheet.lower(),
+            ),
+        )
 
         for start in range(0, len(year_rows), chunk_size):
             end = min(start + chunk_size, len(year_rows))
             label_start = start + 1
             label_end = end
-            sheet_name = f"{year}_{label_start:04d}_{label_end:04d}"
+            sheet_name = f"{academic_year}_{label_start:04d}_{label_end:04d}"
             ws = wb.create_sheet(title=sheet_name[:31])
             ws.append(STANDARD_COLUMNS)
             style_header(ws)
@@ -374,11 +483,17 @@ def write_year_sheets(wb: Workbook, rows: List[ExtractedRow], chunk_size: int = 
             autosize_columns(ws)
 
 
-def build_master_roster(input_root: Path, output_file: Path, chunk_size: int, keep_duplicates: bool, verbose: bool) -> None:
+def build_master_roster(
+    input_root: Path,
+    output_file: Path,
+    chunk_size: int,
+    keep_duplicates: bool,
+    verbose: bool,
+) -> None:
     all_rows: List[ExtractedRow] = []
     issues: List[str] = []
 
-    files = sorted([p for p in input_root.rglob("*") if p.suffix.lower() in SUPPORTED_EXTENSIONS])
+    files = sorted(path for path in input_root.rglob("*") if path.suffix.lower() in SUPPORTED_EXTENSIONS)
     if not files:
         raise FileNotFoundError(
             f"No Excel files found under {input_root}. Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
@@ -389,23 +504,39 @@ def build_master_roster(input_root: Path, output_file: Path, chunk_size: int, ke
         all_rows.extend(extracted)
         issues.extend(file_issues)
 
+    duplicates_removed = 0
     if not keep_duplicates:
-        all_rows = dedupe_rows(all_rows)
+        all_rows, duplicates_removed = dedupe_rows(all_rows)
+
+    all_rows, same_year_id_removed = dedupe_same_year_banner_ids(all_rows)
 
     wb = Workbook()
-    write_summary_sheet(wb, all_rows, issues)
+    write_summary_sheet(
+        wb,
+        all_rows,
+        issues,
+        total_files=len(files),
+        duplicates_removed=duplicates_removed,
+        same_year_id_removed=same_year_id_removed,
+    )
     write_year_sheets(wb, all_rows, chunk_size=chunk_size)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_file)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a single FSL master roster workbook from year-by-year folders of chapter rosters. "
-            "The output workbook creates sheets separated by year and chunked into groups of 1000 rows."
+            "Build a single FSL master roster workbook from semester folders of chapter rosters. "
+            "If no input path is supplied, the script uses a local 'Copy of Rosters' folder next to the code."
         )
     )
-    parser.add_argument("input_root", help="Root folder containing year folders of roster Excel files.")
+    parser.add_argument(
+        "input_root",
+        nargs="?",
+        default=str(DEFAULT_INPUT_ROOT),
+        help="Root folder containing semester folders like 'Fall 2015' and 'Spring 2026'.",
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -421,7 +552,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-duplicates",
         action="store_true",
-        help="Keep exact duplicate rows instead of removing them.",
+        help="Keep cross-file duplicate rows. The same-year duplicate Banner ID pass still runs.",
     )
     parser.add_argument(
         "--verbose",
