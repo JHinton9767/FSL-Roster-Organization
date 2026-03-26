@@ -188,6 +188,16 @@ def normalize_banner_id(value: str) -> str:
     return re.sub(r"\.0$", "", text)
 
 
+def identity_key(row: ExtractedRow) -> Optional[Tuple[str, ...]]:
+    if row.banner_id:
+        return ("banner", row.banner_id.lower())
+    if row.email:
+        return ("email", row.email.lower())
+    if row.last_name or row.first_name:
+        return ("name", row.chapter.lower(), row.last_name.lower(), row.first_name.lower())
+    return None
+
+
 def parse_term_from_path(path: Path) -> Tuple[str, str]:
     for part in path.parts:
         match = SEMESTER_FOLDER_RE.fullmatch(part)
@@ -491,7 +501,7 @@ def dedupe_rows(rows: List[ExtractedRow]) -> Tuple[List[ExtractedRow], int]:
 
 
 def dedupe_same_year_banner_ids(rows: List[ExtractedRow]) -> Tuple[List[ExtractedRow], int]:
-    seen: Set[Tuple[str, str]] = set()
+    seen: Set[Tuple[str, str, str]] = set()
     deduped: List[ExtractedRow] = []
     removed = 0
 
@@ -499,15 +509,15 @@ def dedupe_same_year_banner_ids(rows: List[ExtractedRow]) -> Tuple[List[Extracte
         rows,
         key=lambda item: (
             item.academic_year.lower(),
-            item.banner_id.lower() if item.banner_id else "zzzzzzzz",
             item.term.lower(),
+            item.banner_id.lower() if item.banner_id else "zzzzzzzz",
             item.chapter.lower(),
             item.source_file.lower(),
             item.source_sheet.lower(),
         ),
     ):
         if row.banner_id:
-            key = (row.academic_year.lower(), row.banner_id.lower())
+            key = (row.academic_year.lower(), row.term.lower(), row.banner_id.lower())
             if key in seen:
                 removed += 1
                 continue
@@ -515,6 +525,68 @@ def dedupe_same_year_banner_ids(rows: List[ExtractedRow]) -> Tuple[List[Extracte
         deduped.append(row)
 
     return deduped, removed
+
+
+def infer_missing_spring_members(rows: List[ExtractedRow]) -> Tuple[List[ExtractedRow], int]:
+    fall_rows_by_year_chapter: Dict[Tuple[int, str], List[ExtractedRow]] = defaultdict(list)
+    spring_keys_by_year_chapter: Dict[Tuple[int, str], Set[Tuple[str, ...]]] = defaultdict(set)
+
+    for row in rows:
+        term_lower = row.term.lower()
+        chapter_key = row.chapter.lower()
+        key = identity_key(row)
+        if term_lower.startswith("fall") and re.fullmatch(r"(19|20)\d{2}", row.academic_year):
+            fall_rows_by_year_chapter[(int(row.academic_year), chapter_key)].append(row)
+        elif term_lower.startswith("spring") and re.fullmatch(r"(19|20)\d{2}", row.academic_year) and key is not None:
+            spring_keys_by_year_chapter[(int(row.academic_year), chapter_key)].add(key)
+
+    inferred_rows: List[ExtractedRow] = []
+
+    fall_years = sorted({year for year, _ in fall_rows_by_year_chapter.keys()})
+    for year in fall_years:
+        next_year = year + 1
+        current_chapters = {chapter for fall_year, chapter in fall_rows_by_year_chapter.keys() if fall_year == year}
+
+        for chapter_key in current_chapters:
+            current_fall = fall_rows_by_year_chapter.get((year, chapter_key), [])
+            next_fall = fall_rows_by_year_chapter.get((next_year, chapter_key), [])
+            if not current_fall or not next_fall:
+                continue
+
+            current_keys = {key for key in (identity_key(row) for row in current_fall) if key is not None}
+            existing_spring_keys = spring_keys_by_year_chapter[(next_year, chapter_key)]
+
+            for row in next_fall:
+                key = identity_key(row)
+                if key is None:
+                    continue
+                if row.status.strip().lower() == "new member":
+                    continue
+                if key in current_keys:
+                    continue
+                if key in existing_spring_keys:
+                    continue
+
+                spring_term = f"Spring {next_year}"
+                inferred_rows.append(
+                    ExtractedRow(
+                        academic_year=str(next_year),
+                        term=spring_term,
+                        source_file=row.source_file,
+                        source_sheet=f"{row.source_sheet} [Inferred Spring]",
+                        chapter=row.chapter,
+                        last_name=row.last_name,
+                        first_name=row.first_name,
+                        banner_id=row.banner_id,
+                        email=row.email,
+                        status="New Member",
+                        semester_joined=spring_term,
+                        position=row.position,
+                    )
+                )
+                existing_spring_keys.add(key)
+
+    return rows + inferred_rows, len(inferred_rows)
 
 
 def autosize_columns(ws) -> None:
@@ -544,6 +616,7 @@ def write_summary_sheet(
     total_files: int,
     duplicates_removed: int,
     same_year_id_removed: int,
+    inferred_spring_members: int,
 ) -> None:
     ws = wb.active
     ws.title = "Summary"
@@ -575,7 +648,8 @@ def write_summary_sheet(
         ["Distinct terms", len(by_term)],
         ["Distinct chapters", len(chapters)],
         ["Duplicate rows removed", duplicates_removed],
-        ["Same-year duplicate Banner IDs removed", same_year_id_removed],
+        ["Same-semester duplicate Banner IDs removed", same_year_id_removed],
+        ["Inferred spring members added", inferred_spring_members],
     ]
     for item in metrics:
         ws.append(item)
@@ -639,10 +713,10 @@ def write_year_sheets(wb: Workbook, rows: List[ExtractedRow], chunk_size: int = 
         year_rows = sorted(
             grouped[academic_year],
             key=lambda item: (
+                item.term.lower(),
                 item.banner_id.lower() if item.banner_id else "zzzzzzzz",
                 item.last_name.lower(),
                 item.first_name.lower(),
-                item.term.lower(),
                 item.chapter.lower(),
                 item.source_file.lower(),
                 item.source_sheet.lower(),
@@ -700,6 +774,11 @@ def build_master_roster(
     if not keep_duplicates:
         all_rows, duplicates_removed = dedupe_rows(all_rows)
 
+    all_rows, inferred_spring_members = infer_missing_spring_members(all_rows)
+
+    if not keep_duplicates:
+        all_rows, _ = dedupe_rows(all_rows)
+
     all_rows, same_year_id_removed = dedupe_same_year_banner_ids(all_rows)
 
     wb = Workbook()
@@ -711,6 +790,7 @@ def build_master_roster(
         total_files=len(files),
         duplicates_removed=duplicates_removed,
         same_year_id_removed=same_year_id_removed,
+        inferred_spring_members=inferred_spring_members,
     )
     write_year_sheets(wb, all_rows, chunk_size=chunk_size)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -751,7 +831,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keep-duplicates",
         action="store_true",
-        help="Keep cross-file duplicate rows. The same-year duplicate Banner ID pass still runs.",
+        help="Keep cross-file duplicate rows. The same-semester duplicate Banner ID pass still runs.",
     )
     parser.add_argument(
         "--verbose",
