@@ -282,14 +282,31 @@ def extract_header_blocks_from_row(values: List[object]) -> List[Dict[str, objec
 
 
 def find_header_blocks(ws) -> List[Dict[str, object]]:
-    max_scan_row = min(ws.max_row, 30)
-    cached_rows = list(ws.iter_rows(min_row=1, max_row=max_scan_row, values_only=True))
-    best_blocks: Dict[Tuple[int, ...], Dict[str, object]] = {}
+    cached_rows = list(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 30), values_only=True))
+
+    for row_number in [1, 2, 3]:
+        if row_number <= len(cached_rows):
+            row_values = list(cached_rows[row_number - 1])
+            blocks = extract_header_blocks_from_row(row_values)
+            if blocks:
+                return [
+                    {
+                        "row_idx": row_number,
+                        "start_col": block["start_col"],
+                        "end_col": block["end_col"],
+                        "header_map": block["header_map"],
+                        "score": block["score"],
+                    }
+                    for block in blocks
+                ]
+
+    best_by_signature: Dict[Tuple[int, ...], Dict[str, object]] = {}
 
     for row_idx, row in enumerate(cached_rows, start=1):
-        candidate_rows = [(row_idx, list(row))]
+        row_values = list(row)
+        candidate_rows = [(row_idx, row_values)]
 
-        if is_banner_row(list(row)) and row_idx < len(cached_rows):
+        if is_banner_row(row_values) and row_idx < len(cached_rows):
             candidate_rows.append((row_idx + 1, list(cached_rows[row_idx])))
 
         for candidate_idx, candidate_values in candidate_rows:
@@ -297,7 +314,7 @@ def find_header_blocks(ws) -> List[Dict[str, object]]:
             for block in blocks:
                 header_map = block["header_map"]
                 signature = tuple(sorted(header_map.values()))
-                existing = best_blocks.get(signature)
+                existing = best_by_signature.get(signature)
 
                 block_record = {
                     "row_idx": candidate_idx,
@@ -308,14 +325,14 @@ def find_header_blocks(ws) -> List[Dict[str, object]]:
                 }
 
                 if existing is None:
-                    best_blocks[signature] = block_record
+                    best_by_signature[signature] = block_record
                 else:
                     if block_record["score"] > existing["score"]:
-                        best_blocks[signature] = block_record
+                        best_by_signature[signature] = block_record
                     elif block_record["score"] == existing["score"] and block_record["row_idx"] < existing["row_idx"]:
-                        best_blocks[signature] = block_record
+                        best_by_signature[signature] = block_record
 
-    return sorted(best_blocks.values(), key=lambda item: (item["row_idx"], item["start_col"]))
+    return sorted(best_by_signature.values(), key=lambda item: (item["row_idx"], item["start_col"]))
 
 
 def row_looks_like_header(values: List[object]) -> bool:
@@ -355,10 +372,10 @@ def extract_rows_from_workbook(path: Path, verbose: bool = False) -> Tuple[List[
             sheet_rows = list(ws.iter_rows(values_only=True))
 
             for block in header_blocks:
-                header_row_idx = block["row_idx"]
+                header_row_idx = int(block["row_idx"])
                 header_map = block["header_map"]
-                start_col = block["start_col"]
-                end_col = block["end_col"]
+                start_col = int(block["start_col"])
+                end_col = int(block["end_col"])
 
                 for row in sheet_rows[header_row_idx:]:
                     block_slice = list(row[start_col : end_col + 1])
