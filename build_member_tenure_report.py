@@ -4,12 +4,12 @@ import argparse
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 
-from src.build_master_roster import (
+from fsl_master_roster_builder import (
     DEFAULT_INPUT_ROOT,
     ExtractedRow,
     SUPPORTED_EXTENSIONS,
@@ -23,7 +23,7 @@ from src.build_master_roster import (
 )
 
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 DEFAULT_MASTER_WORKBOOK = ROOT / "Master_FSL_Roster.xlsx"
 DEFAULT_OUTPUT_WORKBOOK = ROOT / "Member_Tenure_Report.xlsx"
 MASTER_REQUIRED_COLUMNS = {
@@ -114,12 +114,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--master",
         default=str(DEFAULT_MASTER_WORKBOOK),
-        help="Path to Master_FSL_Roster.xlsx. Default: Master_FSL_Roster.xlsx next to the code.",
+        help="Path to Master_FSL_Roster.xlsx. Default: Master_FSL_Roster.xlsx in this folder.",
     )
     parser.add_argument(
         "--raw-root",
         default=str(DEFAULT_INPUT_ROOT),
-        help="Path to the Copy of Rosters folder. Default: Copy of Rosters next to the code.",
+        help='Path to the "Copy of Rosters" folder. Default: Copy of Rosters in this folder.',
     )
     parser.add_argument(
         "-o",
@@ -182,6 +182,13 @@ def term_label_sort(term_label: str) -> Tuple[int, int, str]:
     return term_sort_key(year_match, term_label)
 
 
+def get_value(row: Tuple[object, ...], header_map: Dict[str, int], column: str) -> str:
+    idx = header_map.get(column)
+    if idx is None or idx >= len(row):
+        return ""
+    return clean_text(row[idx])
+
+
 def load_master_roster(master_path: Path) -> List[ExtractedRow]:
     rows: List[ExtractedRow] = []
     if not master_path.exists():
@@ -236,13 +243,6 @@ def load_master_roster(master_path: Path) -> List[ExtractedRow]:
     finally:
         wb.close()
     return rows
-
-
-def get_value(row: Tuple[object, ...], header_map: Dict[str, int], column: str) -> str:
-    idx = header_map.get(column)
-    if idx is None or idx >= len(row):
-        return ""
-    return clean_text(row[idx])
 
 
 def load_raw_rosters(raw_root: Path, verbose: bool = False) -> List[ExtractedRow]:
@@ -303,7 +303,7 @@ def build_member_journeys(rows: Sequence[ExtractedRow]) -> List[MemberJourney]:
             exit_reason = final_status
 
         returned_later = "No"
-        for idx, term_rows in enumerate(ordered_term_rows[:-1]):
+        for term_rows in ordered_term_rows[:-1]:
             if choose_status(term_rows) in TERMINAL_STATUSES:
                 returned_later = "Yes"
                 break
