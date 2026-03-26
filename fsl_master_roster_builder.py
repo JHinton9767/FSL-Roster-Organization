@@ -92,6 +92,11 @@ HEADER_ALIASES = {
     ],
 }
 
+CANONICAL_ALIAS_MAP = {
+    standard_name: {re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", "", alias.lower().replace("_", " "))).strip() for alias in aliases}
+    for standard_name, aliases in HEADER_ALIASES.items()
+}
+
 STATUS_MAP = {
     "A": "Active",
     "AL": "Alumni",
@@ -102,28 +107,6 @@ STATUS_MAP = {
     "RS": "Resigned",
     "RV": "Revoked",
     "T": "Transfer",
-}
-
-
-def clean_text(value: object) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def canonical_header(value: object) -> str:
-    text = clean_text(value).lower()
-    text = text.replace("_", " ")
-    text = re.sub(r"[^a-z0-9 ]+", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-CANONICAL_ALIAS_MAP = {
-    standard_name: {canonical_header(alias) for alias in aliases}
-    for standard_name, aliases in HEADER_ALIASES.items()
 }
 
 
@@ -171,6 +154,33 @@ class FileExtractionStatus:
     @property
     def extracted_flag(self) -> str:
         return "Yes" if self.rows_extracted > 0 else "No"
+
+
+def clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def canonical_header(value: object) -> str:
+    text = clean_text(value).lower()
+    text = text.replace("_", " ")
+    text = re.sub(r"[^a-z0-9 ]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def header_matches(standard_name: str, header: str) -> bool:
+    aliases = CANONICAL_ALIAS_MAP[standard_name]
+    if header in aliases:
+        return True
+
+    if standard_name == "status":
+        return header.startswith("status") or " status " in f" {header} "
+
+    return any(alias in header for alias in aliases if len(alias) > 4)
 
 
 def normalize_status(value: str) -> str:
@@ -261,8 +271,8 @@ def score_header_row(values: List[object]) -> Tuple[int, Dict[str, int]]:
     matched: Dict[str, int] = {}
     canon = [canonical_header(value) for value in values]
     for idx, header in enumerate(canon):
-        for standard_name, aliases in CANONICAL_ALIAS_MAP.items():
-            if header in aliases and standard_name not in matched:
+        for standard_name in CANONICAL_ALIAS_MAP:
+            if header_matches(standard_name, header) and standard_name not in matched:
                 matched[standard_name] = idx
     return len(matched), matched
 
@@ -281,8 +291,8 @@ def extract_header_blocks_from_row(values: List[object]) -> List[Dict[str, objec
     matches: List[Tuple[int, str]] = []
 
     for idx, header in enumerate(canon):
-        for standard_name, aliases in CANONICAL_ALIAS_MAP.items():
-            if header in aliases:
+        for standard_name in CANONICAL_ALIAS_MAP:
+            if header_matches(standard_name, header):
                 matches.append((idx, standard_name))
                 break
 
@@ -379,6 +389,29 @@ def find_header_blocks(ws) -> List[Dict[str, object]]:
     return sorted(best_by_signature.values(), key=lambda item: (item["row_idx"], item["start_col"]))
 
 
+def find_status_column(ws, max_scan_rows: int = 30) -> Tuple[Optional[int], Optional[int]]:
+    best_match: Tuple[int, Optional[int], Optional[int]] = (0, None, None)
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, max_scan_rows), values_only=True), start=1):
+        for col_idx, value in enumerate(row):
+            header = canonical_header(value)
+            if not header:
+                continue
+
+            score = 0
+            if header == "status":
+                score = 3
+            elif header.startswith("status"):
+                score = 2
+            elif " status " in f" {header} ":
+                score = 1
+
+            if score > best_match[0]:
+                best_match = (score, row_idx, col_idx)
+
+    return best_match[1], best_match[2]
+
+
 def row_looks_like_header(values: List[object]) -> bool:
     score, header_map = score_header_row(values)
     return score >= 3 and {"last_name", "first_name"}.issubset(header_map)
@@ -413,15 +446,24 @@ def extract_rows_from_workbook(path: Path, verbose: bool = False) -> Tuple[List[
                 issues.append(f"Skipped {path.name} | sheet '{ws.title}': no usable header blocks found.")
                 continue
 
+            status_row_idx, status_col_idx = find_status_column(ws)
+            if status_col_idx is None:
+                issues.append(f"Status column not found after full scan in {path.name} | sheet '{ws.title}'.")
+
             sheet_rows = list(ws.iter_rows(values_only=True))
 
             for block in header_blocks:
                 header_row_idx = int(block["row_idx"])
-                header_map = block["header_map"]
+                header_map = dict(block["header_map"])
                 start_col = int(block["start_col"])
                 end_col = int(block["end_col"])
 
-                for row in sheet_rows[header_row_idx:]:
+                if "status" not in header_map and status_col_idx is not None:
+                    header_map["status"] = status_col_idx
+
+                data_start_row = max(header_row_idx, status_row_idx or header_row_idx) + 1
+
+                for row in sheet_rows[data_start_row - 1 :]:
                     block_slice = list(row[start_col : end_col + 1])
 
                     if is_banner_row(block_slice):
