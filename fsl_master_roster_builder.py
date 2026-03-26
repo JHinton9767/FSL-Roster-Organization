@@ -159,6 +159,20 @@ class ExtractedRow:
         ]
 
 
+@dataclass(frozen=True)
+class FileExtractionStatus:
+    academic_year: str
+    term: str
+    source_file: str
+    relative_path: str
+    rows_extracted: int
+    issue_count: int
+
+    @property
+    def extracted_flag(self) -> str:
+        return "Yes" if self.rows_extracted > 0 else "No"
+
+
 def normalize_status(value: str) -> str:
     raw = clean_text(value)
     upper = raw.upper()
@@ -189,6 +203,26 @@ def parse_term_from_path(path: Path) -> Tuple[str, str]:
     if year_match:
         return year_match.group(1), year_match.group(1)
     return "Unknown", "Unknown"
+
+
+def term_sort_key(academic_year: str, term: str) -> Tuple[int, int, str]:
+    year_value = 9999
+    if re.fullmatch(r"(19|20)\d{2}", academic_year):
+        year_value = int(academic_year)
+
+    term_lower = clean_text(term).lower()
+    if term_lower.startswith("winter"):
+        season_value = 0
+    elif term_lower.startswith("spring"):
+        season_value = 1
+    elif term_lower.startswith("summer"):
+        season_value = 2
+    elif term_lower.startswith("fall"):
+        season_value = 3
+    else:
+        season_value = 9
+
+    return year_value, season_value, term_lower
 
 
 def infer_chapter(path: Path, sheet_name: str) -> str:
@@ -506,6 +540,7 @@ def write_summary_sheet(
     wb: Workbook,
     rows: List[ExtractedRow],
     issues: List[str],
+    file_statuses: List[FileExtractionStatus],
     total_files: int,
     duplicates_removed: int,
     same_year_id_removed: int,
@@ -558,17 +593,38 @@ def write_summary_sheet(
     for cell in ws[ws.max_row]:
         cell.fill = PatternFill("solid", fgColor="D9EAF7")
         cell.font = Font(bold=True)
-    for term in sorted(by_term.keys()):
+    for term in sorted(by_term.keys(), key=lambda item: term_sort_key(re.search(r"(19|20)\d{2}", item).group(0) if re.search(r"(19|20)\d{2}", item) else "9999", item)):
         ws.append([term, by_term[term]])
 
     ws.append([])
-    ws.append(["Import Issues"])
+    ws.append(["Important Issues"])
     ws[ws.max_row][0].font = Font(bold=True)
     if issues:
         for issue in issues:
             ws.append([issue])
     else:
         ws.append(["None"])
+
+    ws.append([])
+    ws.append(["File Extraction Check"])
+    ws[ws.max_row][0].font = Font(bold=True)
+    ws.append(["Academic Year", "Term", "Source File", "Relative Path", "Rows Extracted", "Extracted Data", "Issue Count"])
+    for cell in ws[ws.max_row]:
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        cell.font = Font(bold=True)
+
+    for status in sorted(file_statuses, key=lambda item: (term_sort_key(item.academic_year, item.term), item.relative_path.lower())):
+        ws.append(
+            [
+                status.academic_year,
+                status.term,
+                status.source_file,
+                status.relative_path,
+                status.rows_extracted,
+                status.extracted_flag,
+                status.issue_count,
+            ]
+        )
 
     ws.freeze_panes = "A2"
     autosize_columns(ws)
@@ -616,6 +672,7 @@ def build_master_roster(
 ) -> None:
     all_rows: List[ExtractedRow] = []
     issues: List[str] = []
+    file_statuses: List[FileExtractionStatus] = []
 
     files = sorted(path for path in input_root.rglob("*") if path.suffix.lower() in SUPPORTED_EXTENSIONS)
     if not files:
@@ -625,8 +682,19 @@ def build_master_roster(
 
     for path in files:
         extracted, file_issues = extract_rows_from_workbook(path, verbose=verbose)
+        academic_year, term = parse_term_from_path(path)
         all_rows.extend(extracted)
         issues.extend(file_issues)
+        file_statuses.append(
+            FileExtractionStatus(
+                academic_year=academic_year,
+                term=term,
+                source_file=path.name,
+                relative_path=str(path.relative_to(input_root)),
+                rows_extracted=len(extracted),
+                issue_count=len(file_issues),
+            )
+        )
 
     duplicates_removed = 0
     if not keep_duplicates:
@@ -639,6 +707,7 @@ def build_master_roster(
         wb,
         all_rows,
         issues,
+        file_statuses,
         total_files=len(files),
         duplicates_removed=duplicates_removed,
         same_year_id_removed=same_year_id_removed,
