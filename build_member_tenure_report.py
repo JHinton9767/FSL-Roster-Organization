@@ -4,12 +4,12 @@ import argparse
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
 
-from fsl_master_roster_builder import (
+from src.build_master_roster import (
     DEFAULT_INPUT_ROOT,
     ExtractedRow,
     SUPPORTED_EXTENSIONS,
@@ -23,7 +23,7 @@ from fsl_master_roster_builder import (
 )
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MASTER_WORKBOOK = ROOT / "Master_FSL_Roster.xlsx"
 DEFAULT_OUTPUT_WORKBOOK = ROOT / "Member_Tenure_Report.xlsx"
 MASTER_REQUIRED_COLUMNS = {
@@ -104,6 +104,10 @@ class MemberJourney:
             self.status_history,
         ]
 
+    @property
+    def confirmed_join_within_window(self) -> str:
+        return "Yes" if self.first_new_member_term else "No"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -114,12 +118,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--master",
         default=str(DEFAULT_MASTER_WORKBOOK),
-        help="Path to Master_FSL_Roster.xlsx. Default: Master_FSL_Roster.xlsx in this folder.",
+        help="Path to Master_FSL_Roster.xlsx. Default: Master_FSL_Roster.xlsx next to the code.",
     )
     parser.add_argument(
         "--raw-root",
         default=str(DEFAULT_INPUT_ROOT),
-        help='Path to the "Copy of Rosters" folder. Default: Copy of Rosters in this folder.',
+        help="Path to the Copy of Rosters folder. Default: Copy of Rosters next to the code.",
     )
     parser.add_argument(
         "-o",
@@ -182,13 +186,6 @@ def term_label_sort(term_label: str) -> Tuple[int, int, str]:
     return term_sort_key(year_match, term_label)
 
 
-def get_value(row: Tuple[object, ...], header_map: Dict[str, int], column: str) -> str:
-    idx = header_map.get(column)
-    if idx is None or idx >= len(row):
-        return ""
-    return clean_text(row[idx])
-
-
 def load_master_roster(master_path: Path) -> List[ExtractedRow]:
     rows: List[ExtractedRow] = []
     if not master_path.exists():
@@ -243,6 +240,13 @@ def load_master_roster(master_path: Path) -> List[ExtractedRow]:
     finally:
         wb.close()
     return rows
+
+
+def get_value(row: Tuple[object, ...], header_map: Dict[str, int], column: str) -> str:
+    idx = header_map.get(column)
+    if idx is None or idx >= len(row):
+        return ""
+    return clean_text(row[idx])
 
 
 def load_raw_rosters(raw_root: Path, verbose: bool = False) -> List[ExtractedRow]:
@@ -303,7 +307,7 @@ def build_member_journeys(rows: Sequence[ExtractedRow]) -> List[MemberJourney]:
             exit_reason = final_status
 
         returned_later = "No"
-        for term_rows in ordered_term_rows[:-1]:
+        for idx, term_rows in enumerate(ordered_term_rows[:-1]):
             if choose_status(term_rows) in TERMINAL_STATUSES:
                 returned_later = "Yes"
                 break
@@ -353,11 +357,14 @@ def write_summary_sheet(wb: Workbook, journeys: Sequence[MemberJourney], master_
     style_header(ws)
 
     counts_by_semester = defaultdict(int)
+    confirmed_counts_by_semester = defaultdict(int)
     counts_by_exit_reason = defaultdict(int)
     returned_count = 0
 
     for journey in journeys:
         counts_by_semester[journey.semester_count] += 1
+        if journey.first_new_member_term:
+            confirmed_counts_by_semester[journey.semester_count] += 1
         if journey.exit_reason:
             counts_by_exit_reason[journey.exit_reason] += 1
         if journey.returned_later == "Yes":
@@ -369,6 +376,8 @@ def write_summary_sheet(wb: Workbook, journeys: Sequence[MemberJourney], master_
         ["Distinct member journeys", len(journeys)],
         ["Journeys with observed new-member term", sum(1 for item in journeys if item.first_new_member_term)],
         ["Journeys with inferred first-observed start", sum(1 for item in journeys if not item.first_new_member_term)],
+        ["Confirmed in-window joins", sum(1 for item in journeys if item.first_new_member_term)],
+        ["Unconfirmed pre-window carryovers", sum(1 for item in journeys if not item.first_new_member_term)],
         ["Members who returned after a terminal status", returned_count],
     ]
 
@@ -382,6 +391,14 @@ def write_summary_sheet(wb: Workbook, journeys: Sequence[MemberJourney], master_
         cell.font = Font(bold=True)
     for semester_count in sorted(counts_by_semester):
         ws.append([semester_count, counts_by_semester[semester_count]])
+
+    ws.append([])
+    ws.append(["Semester Count", "Confirmed In-Window Join Count"])
+    for cell in ws[ws.max_row]:
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        cell.font = Font(bold=True)
+    for semester_count in sorted(confirmed_counts_by_semester):
+        ws.append([semester_count, confirmed_counts_by_semester[semester_count]])
 
     ws.append([])
     ws.append(["Exit Reason", "Member Count"])
@@ -417,6 +434,7 @@ def write_semester_sheets(wb: Workbook, journeys: Sequence[MemberJourney]) -> No
         "Exit Reason",
         "Final Status",
         "Returned Later",
+        "Confirmed Join In Window",
         "Semester Count",
         "Term History",
         "Status History",
@@ -424,10 +442,25 @@ def write_semester_sheets(wb: Workbook, journeys: Sequence[MemberJourney]) -> No
 
     for semester_count in sorted(grouped):
         ws = wb.create_sheet(title=f"{semester_count}_Semester"[:31])
+        ws.append(["All Observed Members"])
+        ws[ws.max_row][0].font = Font(bold=True)
         ws.append(headers)
-        style_header(ws)
+        for cell in ws[ws.max_row]:
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.font = Font(bold=True)
         for journey in grouped[semester_count]:
-            ws.append(journey.as_list())
+            ws.append(journey.as_list()[:13] + [journey.confirmed_join_within_window] + journey.as_list()[13:])
+
+        ws.append([])
+        ws.append(["Confirmed In-Window Joins Only"])
+        ws[ws.max_row][0].font = Font(bold=True)
+        ws.append(headers)
+        for cell in ws[ws.max_row]:
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.font = Font(bold=True)
+        for journey in grouped[semester_count]:
+            if journey.first_new_member_term:
+                ws.append(journey.as_list()[:13] + [journey.confirmed_join_within_window] + journey.as_list()[13:])
         ws.freeze_panes = "A2"
         autosize_columns(ws)
 
